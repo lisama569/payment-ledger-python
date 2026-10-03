@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from .errors import (
     AmountExceededError,
     CurrencyMismatchError,
+    DuplicateExternalRefError,
     IdempotencyConflictError,
     InvalidAmountError,
     InvalidStateTransitionError,
@@ -23,7 +24,7 @@ from .models import (
     RefundRequest,
 )
 from .reconciliation import Reconciler
-from .reconciliation_types import SettlementRecord
+from .reconciliation_types import ReconciliationScope, SettlementRecord
 from .repository import LedgerRepository
 from .service import PaymentLedgerService
 
@@ -36,6 +37,7 @@ _HTTP_STATUS = {
     CurrencyMismatchError: 422,
     InvalidAmountError: 400,
     IdempotencyConflictError: 409,
+    DuplicateExternalRefError: 409,
 }
 
 
@@ -48,11 +50,13 @@ class AuthorizeBody(BaseModel):
 class CaptureBody(BaseModel):
     amount: int | None = Field(default=None, strict=True)
     currency: str
+    external_ref: str | None = None
 
 
 class RefundBody(BaseModel):
     amount: int | None = Field(default=None, strict=True)
     currency: str
+    external_ref: str | None = None
 
 
 class SettlementLine(BaseModel):
@@ -63,8 +67,20 @@ class SettlementLine(BaseModel):
     currency: str
 
 
+class ReconcileScopeBody(BaseModel):
+    from_seq: int | None = None
+    to_seq: int | None = None
+    from_time: str | None = None
+    to_time: str | None = None
+    incremental: bool = False
+
+
 class ReconcileBody(BaseModel):
     statement: list[SettlementLine]
+    scope: ReconcileScopeBody | None = None
+    # When true, the conclusion is persisted as a recorded run that can
+    # be listed, re-fetched after restart and diffed against other runs.
+    record: bool = False
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -106,7 +122,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     ):
         try:
             result = service.capture(
-                CaptureRequest(payment_id, body.amount, body.currency),
+                CaptureRequest(payment_id, body.amount, body.currency, body.external_ref),
                 idempotency_key,
             )
         except LedgerError as exc:
@@ -121,7 +137,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     ):
         try:
             result = service.refund(
-                RefundRequest(payment_id, body.amount, body.currency),
+                RefundRequest(payment_id, body.amount, body.currency, body.external_ref),
                 idempotency_key,
             )
         except LedgerError as exc:
@@ -149,11 +165,32 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "amount": e.amount,
                     "currency": e.currency,
                     "idempotency_key": e.idempotency_key,
+                    "external_ref": e.external_ref,
                     "created_at": e.created_at,
                 }
                 for e in payment.entries
 
             ],
+        }
+
+    def item_to_dict(item) -> dict:
+        return {
+            **asdict(item),
+            "entry_type": item.entry_type.value,
+            "discrepancy": item.discrepancy.value if item.discrepancy else None,
+        }
+
+    def scope_to_dict(scope: ReconciliationScope) -> dict:
+        return asdict(scope)
+
+    def run_to_dict(run) -> dict:
+        return {
+            "run_id": run.run_id,
+            "created_at": run.created_at,
+            "scope": scope_to_dict(run.scope),
+            "statement_digest": run.statement_digest,
+            "matched": [item_to_dict(m) for m in run.matched],
+            "discrepancies": [item_to_dict(d) for d in run.discrepancies],
         }
 
     @app.post("/v1/reconcile")
@@ -168,17 +205,47 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
             for line in body.statement
         ]
-        report = reconciler.reconcile(statement)
+        scope = None
+        if body.scope is not None:
+            scope = ReconciliationScope(
+                from_seq=body.scope.from_seq,
+                to_seq=body.scope.to_seq,
+                from_time=body.scope.from_time,
+                to_time=body.scope.to_time,
+                incremental=body.scope.incremental,
+            )
+        if body.record:
+            run = reconciler.reconcile_and_record(statement, scope)
+            return {"run_id": run.run_id, **run_to_dict(run)}
+        report = reconciler.reconcile(statement, scope)
         return {
-            "matched": [asdict(m) | {"entry_type": m.entry_type.value, "discrepancy": None} for m in report.matched],
-            "discrepancies": [
-                {
-                    **asdict(d),
-                    "entry_type": d.entry_type.value,
-                    "discrepancy": d.discrepancy.value if d.discrepancy else None,
-                }
-                for d in report.discrepancies
-            ],
+            "matched": [item_to_dict(m) for m in report.matched],
+            "discrepancies": [item_to_dict(d) for d in report.discrepancies],
+        }
+
+    @app.get("/v1/reconcile/runs")
+    def list_runs():
+        return {"runs": [run_to_dict(r) for r in reconciler.list_runs()]}
+
+    @app.get("/v1/reconcile/runs/{run_id}")
+    def get_run(run_id: int):
+        run = reconciler.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail={"code": "run_not_found", "message": f"reconciliation run {run_id} not found"})
+        return run_to_dict(run)
+
+    @app.get("/v1/reconcile/diff")
+    def diff_runs(older: int, newer: int):
+        try:
+            diff = reconciler.diff_runs(older, newer)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail={"code": "run_not_found", "message": str(exc)})
+        return {
+            "older_run_id": diff.older_run_id,
+            "newer_run_id": diff.newer_run_id,
+            "new_discrepancies": [item_to_dict(d) for d in diff.new_discrepancies],
+            "persisting_discrepancies": [item_to_dict(d) for d in diff.persisting_discrepancies],
+            "resolved_discrepancies": [item_to_dict(d) for d in diff.resolved_discrepancies],
         }
 
     return app

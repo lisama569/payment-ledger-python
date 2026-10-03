@@ -16,6 +16,7 @@ Concurrency model
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -30,6 +31,12 @@ from .models import (
     OperationResult,
     Payment,
     PaymentStatus,
+)
+from .reconciliation_types import (
+    DiscrepancyType,
+    ReconciliationItem,
+    ReconciliationRun,
+    ReconciliationScope,
 )
 
 _SCHEMA = """
@@ -61,7 +68,36 @@ CREATE TABLE IF NOT EXISTS idempotency (
     result_json     TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
+
+-- Reconciliation conclusions are persisted so a run can be inspected,
+-- replayed and diffed after a restart. These tables are append-only
+-- and live separately from the fund-movement tables, which
+-- reconciliation never writes to.
+CREATE TABLE IF NOT EXISTS reconciliation_runs (
+    run_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at          TEXT NOT NULL,
+    scope_json          TEXT NOT NULL,
+    statement_digest    TEXT NOT NULL,
+    max_seq             INTEGER NOT NULL,
+    matched_json        TEXT NOT NULL,
+    discrepancies_json  TEXT NOT NULL
+);
 """
+
+# Databases created before external settlement references existed are
+# upgraded in place: the new column is nullable so old rows simply
+# carry NULL (= no reference registered).
+_MIGRATIONS = (
+    "ALTER TABLE ledger_entries ADD COLUMN external_ref TEXT",
+)
+
+# A given external settlement reference may be attached to at most one
+# ledger entry across ALL payments. SQLite UNIQUE indexes treat NULLs
+# as distinct, so legacy rows without a reference never collide.
+_EXTERNAL_REF_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_external_ref "
+    "ON ledger_entries(external_ref) WHERE external_ref IS NOT NULL"
+)
 
 
 def utc_now_iso() -> str:
@@ -98,6 +134,17 @@ class LedgerRepository:
             self._conn.execute("PRAGMA busy_timeout = 5000")
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring older database files up to the current schema."""
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(ledger_entries)")
+        }
+        if "external_ref" not in cols:
+            self._conn.execute(_MIGRATIONS[0])
+        self._conn.execute(_EXTERNAL_REF_INDEX)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -202,11 +249,20 @@ class LedgerRepository:
         currency: str,
         idempotency_key: str,
         created_at: str,
+        external_ref: str | None = None,
     ) -> LedgerEntry:
         cur = conn.execute(
             "INSERT INTO ledger_entries (payment_id, entry_type, amount, currency, "
-            "idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (payment_id, entry_type.value, amount, currency, idempotency_key, created_at),
+            "idempotency_key, created_at, external_ref) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                payment_id,
+                entry_type.value,
+                amount,
+                currency,
+                idempotency_key,
+                created_at,
+                external_ref,
+            ),
         )
         return LedgerEntry(
             seq=cur.lastrowid,
@@ -216,6 +272,7 @@ class LedgerRepository:
             currency=currency,
             idempotency_key=idempotency_key,
             created_at=created_at,
+            external_ref=external_ref,
         )
 
     def list_entries(
@@ -239,6 +296,7 @@ class LedgerRepository:
                 currency=r["currency"],
                 idempotency_key=r["idempotency_key"],
                 created_at=r["created_at"],
+                external_ref=r["external_ref"],
             )
             for r in rows
         ]
@@ -268,3 +326,106 @@ class LedgerRepository:
         if row is None:
             return None
         return row["request_hash"], row["result_json"]
+
+    # -- reconciliation runs (append-only conclusions) -----------------
+
+    def save_reconciliation_run(
+        self,
+        conn: sqlite3.Connection,
+        scope: ReconciliationScope,
+        statement_digest: str,
+        max_seq: int,
+        matched: list[ReconciliationItem],
+        discrepancies: list[ReconciliationItem],
+        created_at: str,
+    ) -> int:
+        cur = conn.execute(
+            "INSERT INTO reconciliation_runs (created_at, scope_json, "
+            "statement_digest, max_seq, matched_json, discrepancies_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                created_at,
+                json.dumps(
+                    {
+                        "from_seq": scope.from_seq,
+                        "to_seq": scope.to_seq,
+                        "from_time": scope.from_time,
+                        "to_time": scope.to_time,
+                        "incremental": scope.incremental,
+                    },
+                    sort_keys=True,
+                ),
+                statement_digest,
+                max_seq,
+                json.dumps([_item_to_dict(i) for i in matched]),
+                json.dumps([_item_to_dict(i) for i in discrepancies]),
+            ),
+        )
+        return cur.lastrowid
+
+    def get_reconciliation_run(
+        self, conn: sqlite3.Connection, run_id: int
+    ) -> ReconciliationRun | None:
+        row = conn.execute(
+            "SELECT * FROM reconciliation_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_run(row)
+
+    def list_reconciliation_runs(
+        self, conn: sqlite3.Connection
+    ) -> list[ReconciliationRun]:
+        rows = conn.execute(
+            "SELECT * FROM reconciliation_runs ORDER BY run_id"
+        ).fetchall()
+        return [self._row_to_run(r) for r in rows]
+
+    def latest_run_max_seq(self, conn: sqlite3.Connection) -> int | None:
+        """Highest ledger seq covered by the most recent recorded run."""
+        row = conn.execute(
+            "SELECT max_seq FROM reconciliation_runs ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else row["max_seq"]
+
+    @staticmethod
+    def _row_to_run(row: sqlite3.Row) -> ReconciliationRun:
+        scope_data = json.loads(row["scope_json"])
+        return ReconciliationRun(
+            run_id=row["run_id"],
+            created_at=row["created_at"],
+            scope=ReconciliationScope(**scope_data),
+            statement_digest=row["statement_digest"],
+            matched=[_item_from_dict(d) for d in json.loads(row["matched_json"])],
+            discrepancies=[
+                _item_from_dict(d) for d in json.loads(row["discrepancies_json"])
+            ],
+        )
+
+
+def _item_to_dict(item: ReconciliationItem) -> dict:
+    return {
+        "discrepancy": item.discrepancy.value if item.discrepancy else None,
+        "external_ref": item.external_ref,
+        "payment_id": item.payment_id,
+        "entry_type": item.entry_type.value,
+        "ledger_amount": item.ledger_amount,
+        "statement_amount": item.statement_amount,
+        "currency": item.currency,
+        "detail": item.detail,
+    }
+
+
+def _item_from_dict(data: dict) -> ReconciliationItem:
+    return ReconciliationItem(
+        discrepancy=(
+            DiscrepancyType(data["discrepancy"]) if data["discrepancy"] else None
+        ),
+        external_ref=data["external_ref"],
+        payment_id=data["payment_id"],
+        entry_type=EntryType(data["entry_type"]),
+        ledger_amount=data["ledger_amount"],
+        statement_amount=data["statement_amount"],
+        currency=data["currency"],
+        detail=data["detail"],
+    )

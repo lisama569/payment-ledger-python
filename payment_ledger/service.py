@@ -28,6 +28,7 @@ from typing import Callable
 from .errors import (
     AmountExceededError,
     CurrencyMismatchError,
+    DuplicateExternalRefError,
     IdempotencyConflictError,
     InvalidAmountError,
     InvalidStateTransitionError,
@@ -72,6 +73,15 @@ def _validate_currency(currency: str) -> None:
         raise InvalidAmountError(f"currency must be a 3-letter uppercase ISO code, got {currency!r}")
 
 
+def _validate_external_ref(external_ref: str | None) -> None:
+    if external_ref is not None and (
+        not isinstance(external_ref, str) or not external_ref.strip()
+    ):
+        raise InvalidAmountError(
+            f"external_ref must be a non-empty string when provided, got {external_ref!r}"
+        )
+
+
 def _derive_status(payment: Payment) -> PaymentStatus:
     if payment.refunded_amount == payment.captured_amount:
         return PaymentStatus.REFUNDED
@@ -80,6 +90,24 @@ def _derive_status(payment: Payment) -> PaymentStatus:
     if payment.captured_amount == payment.authorized_amount:
         return PaymentStatus.CAPTURED
     return PaymentStatus.PARTIALLY_CAPTURED
+
+
+def _fund_movement_payload(req: CaptureRequest | RefundRequest) -> dict:
+    """Idempotency payload for capture/refund.
+
+    ``external_ref`` is only folded into the hash when actually
+    provided, so a request issued without it hashes exactly like it did
+    before the field existed -- idempotency keys recorded by the old
+    version therefore replay to the same stored conclusion.
+    """
+    payload = {
+        "payment_id": req.payment_id,
+        "amount": req.amount,
+        "currency": req.currency,
+    }
+    if req.external_ref is not None:
+        payload["external_ref"] = req.external_ref
+    return payload
 
 
 def _result_from(payment: Payment, entry_type: EntryType, amount: int, key: str, replayed: bool) -> OperationResult:
@@ -128,6 +156,7 @@ class PaymentLedgerService:
         key: str,
         payload: dict,
         execute: Callable[[sqlite3.Connection], tuple[Payment, EntryType, int]],
+        external_ref: str | None = None,
     ) -> OperationResult:
         request_hash = canonical_request_hash(operation, payload)
 
@@ -161,7 +190,8 @@ class PaymentLedgerService:
                 result = _result_from(payment, entry_type, amount, key, replayed=False)
                 now = utc_now_iso()
                 self.repo.insert_entry(
-                    conn, payment.payment_id, entry_type, amount, payment.currency, key, now
+                    conn, payment.payment_id, entry_type, amount, payment.currency,
+                    key, now, external_ref=external_ref,
                 )
                 self.repo.save_idempotency(
                     conn, key, request_hash, self._serialize_result(result), now
@@ -175,6 +205,14 @@ class PaymentLedgerService:
             with self.repo.transaction() as conn:
                 existing = self.repo.get_idempotency(conn, key)
             if existing is None:
+                # Not an idempotency race: the UNIQUE index on
+                # external_ref rejected the insert -> the same settlement
+                # reference is already attached to another ledger entry.
+                if external_ref is not None:
+                    raise DuplicateExternalRefError(
+                        f"external_ref {external_ref!r} is already registered "
+                        f"on another ledger entry"
+                    ) from exc
                 raise
             stored_hash, stored_result = existing
             if stored_hash != request_hash:
@@ -215,6 +253,7 @@ class PaymentLedgerService:
         if req.amount is not None:
             _validate_money(req.amount, "amount")
         _validate_currency(req.currency)
+        _validate_external_ref(req.external_ref)
         if not idempotency_key:
             raise InvalidAmountError("idempotency_key is required")
 
@@ -250,18 +289,16 @@ class PaymentLedgerService:
         return self._run_idempotent(
             "capture",
             idempotency_key,
-            {
-                "payment_id": req.payment_id,
-                "amount": req.amount,
-                "currency": req.currency,
-            },
+            _fund_movement_payload(req),
             execute,
+            external_ref=req.external_ref,
         )
 
     def refund(self, req: RefundRequest, idempotency_key: str) -> OperationResult:
         if req.amount is not None:
             _validate_money(req.amount, "amount")
         _validate_currency(req.currency)
+        _validate_external_ref(req.external_ref)
         if not idempotency_key:
             raise InvalidAmountError("idempotency_key is required")
 
@@ -293,12 +330,9 @@ class PaymentLedgerService:
         return self._run_idempotent(
             "refund",
             idempotency_key,
-            {
-                "payment_id": req.payment_id,
-                "amount": req.amount,
-                "currency": req.currency,
-            },
+            _fund_movement_payload(req),
             execute,
+            external_ref=req.external_ref,
         )
 
     # -- reads ---------------------------------------------------------
