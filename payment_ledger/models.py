@@ -33,6 +33,9 @@ class LedgerEntry:
     currency: str
     idempotency_key: str
     created_at: str
+    # External settlement reference registered at capture/refund time.
+    # None for entries recorded before this capability existed.
+    external_ref: str | None = None
 
 
 @dataclass
@@ -59,6 +62,8 @@ class CaptureRequest:
     payment_id: str
     amount: int | None  # None => capture the remaining authorized amount
     currency: str
+    # Optional settlement-system reference for this fund movement.
+    external_ref: str | None = None
 
 
 @dataclass
@@ -66,6 +71,8 @@ class RefundRequest:
     payment_id: str
     amount: int | None  # None => refund the full captured amount
     currency: str
+    # Optional settlement-system reference for this fund movement.
+    external_ref: str | None = None
 
 
 @dataclass
@@ -79,3 +86,5 @@ class OperationResult:
     refunded_amount: int
     idempotency_key: str
     replayed: bool
+    # Settlement reference registered with this movement (if any).
+    external_ref: str | None = None

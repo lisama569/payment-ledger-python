@@ -28,6 +28,7 @@ from typing import Callable
 from .errors import (
     AmountExceededError,
     CurrencyMismatchError,
+    DuplicateExternalRefError,
     IdempotencyConflictError,
     InvalidAmountError,
     InvalidStateTransitionError,
@@ -72,6 +73,13 @@ def _validate_currency(currency: str) -> None:
         raise InvalidAmountError(f"currency must be a 3-letter uppercase ISO code, got {currency!r}")
 
 
+def _validate_external_ref(external_ref: str | None) -> None:
+    if external_ref is None:
+        return
+    if not isinstance(external_ref, str) or not external_ref.strip():
+        raise InvalidAmountError("external_ref must be a non-empty string when provided")
+
+
 def _derive_status(payment: Payment) -> PaymentStatus:
     if payment.refunded_amount == payment.captured_amount:
         return PaymentStatus.REFUNDED
@@ -82,7 +90,14 @@ def _derive_status(payment: Payment) -> PaymentStatus:
     return PaymentStatus.PARTIALLY_CAPTURED
 
 
-def _result_from(payment: Payment, entry_type: EntryType, amount: int, key: str, replayed: bool) -> OperationResult:
+def _result_from(
+    payment: Payment,
+    entry_type: EntryType,
+    amount: int,
+    key: str,
+    replayed: bool,
+    external_ref: str | None = None,
+) -> OperationResult:
     return OperationResult(
         payment_id=payment.payment_id,
         status=payment.status,
@@ -93,6 +108,7 @@ def _result_from(payment: Payment, entry_type: EntryType, amount: int, key: str,
         refunded_amount=payment.refunded_amount,
         idempotency_key=key,
         replayed=replayed,
+        external_ref=external_ref,
     )
 
 
@@ -120,6 +136,9 @@ class PaymentLedgerService:
             refunded_amount=data["refunded_amount"],
             idempotency_key=data["idempotency_key"],
             replayed=True,
+            # Records persisted before external_ref existed simply lack
+            # the key; replaying them must yield the original conclusion.
+            external_ref=data.get("external_ref"),
         )
 
     def _run_idempotent(
@@ -127,7 +146,7 @@ class PaymentLedgerService:
         operation: str,
         key: str,
         payload: dict,
-        execute: Callable[[sqlite3.Connection], tuple[Payment, EntryType, int]],
+        execute: Callable[[sqlite3.Connection], tuple[Payment, EntryType, int, str | None]],
     ) -> OperationResult:
         request_hash = canonical_request_hash(operation, payload)
 
@@ -157,11 +176,15 @@ class PaymentLedgerService:
                     # semantics; raise a sentinel handled below instead.
                     return self._deserialize_result(stored_result)
 
-                payment, entry_type, amount = execute(conn)
-                result = _result_from(payment, entry_type, amount, key, replayed=False)
+                payment, entry_type, amount, external_ref = execute(conn)
+                result = _result_from(
+                    payment, entry_type, amount, key, replayed=False,
+                    external_ref=external_ref,
+                )
                 now = utc_now_iso()
                 self.repo.insert_entry(
-                    conn, payment.payment_id, entry_type, amount, payment.currency, key, now
+                    conn, payment.payment_id, entry_type, amount, payment.currency,
+                    key, now, external_ref=external_ref,
                 )
                 self.repo.save_idempotency(
                     conn, key, request_hash, self._serialize_result(result), now
@@ -170,6 +193,13 @@ class PaymentLedgerService:
         except IdempotencyConflictError:
             raise
         except sqlite3.IntegrityError as exc:
+            # The unique index on ledger_entries.external_ref is the hard
+            # backstop against a settlement reference being registered on
+            # two fund movements (e.g. a cross-process race).
+            if "external_ref" in str(exc):
+                raise DuplicateExternalRefError(
+                    "external_ref was already registered on another ledger entry"
+                ) from exc
             # Lost a race on the PRIMARY KEY of idempotency: replay the
             # winner's result if identical, otherwise reject.
             with self.repo.transaction() as conn:
@@ -202,7 +232,7 @@ class PaymentLedgerService:
                     f"payment {req.payment_id!r} already exists; cannot authorize twice"
                 ) from exc
             payment = self.repo.get_payment(conn, req.payment_id)
-            return payment, EntryType.AUTHORIZE, req.amount
+            return payment, EntryType.AUTHORIZE, req.amount, None
 
         return self._run_idempotent(
             "authorize",
@@ -215,6 +245,7 @@ class PaymentLedgerService:
         if req.amount is not None:
             _validate_money(req.amount, "amount")
         _validate_currency(req.currency)
+        _validate_external_ref(req.external_ref)
         if not idempotency_key:
             raise InvalidAmountError("idempotency_key is required")
 
@@ -225,6 +256,13 @@ class PaymentLedgerService:
             if req.currency != payment.currency:
                 raise CurrencyMismatchError(
                     f"request currency {req.currency!r} != payment currency {payment.currency!r}"
+                )
+            if req.external_ref is not None and (
+                self.repo.find_entry_by_external_ref(conn, req.external_ref) is not None
+            ):
+                raise DuplicateExternalRefError(
+                    f"external_ref {req.external_ref!r} is already registered "
+                    "on another ledger entry"
                 )
             capturable = payment.authorized_amount - payment.captured_amount
             if payment.status in (PaymentStatus.REFUNDED, PaymentStatus.VOIDED):
@@ -245,23 +283,25 @@ class PaymentLedgerService:
             payment.captured_amount += amount
             payment.status = _derive_status(payment)
             self.repo.update_payment(conn, payment)
-            return payment, EntryType.CAPTURE, amount
+            return payment, EntryType.CAPTURE, amount, req.external_ref
 
-        return self._run_idempotent(
-            "capture",
-            idempotency_key,
-            {
-                "payment_id": req.payment_id,
-                "amount": req.amount,
-                "currency": req.currency,
-            },
-            execute,
-        )
+        # Backward compatibility: the request fingerprint only carries
+        # external_ref when one is supplied, so idempotency records
+        # written before this field existed still hash identically.
+        payload = {
+            "payment_id": req.payment_id,
+            "amount": req.amount,
+            "currency": req.currency,
+        }
+        if req.external_ref is not None:
+            payload["external_ref"] = req.external_ref
+        return self._run_idempotent("capture", idempotency_key, payload, execute)
 
     def refund(self, req: RefundRequest, idempotency_key: str) -> OperationResult:
         if req.amount is not None:
             _validate_money(req.amount, "amount")
         _validate_currency(req.currency)
+        _validate_external_ref(req.external_ref)
         if not idempotency_key:
             raise InvalidAmountError("idempotency_key is required")
 
@@ -272,6 +312,13 @@ class PaymentLedgerService:
             if req.currency != payment.currency:
                 raise CurrencyMismatchError(
                     f"request currency {req.currency!r} != payment currency {payment.currency!r}"
+                )
+            if req.external_ref is not None and (
+                self.repo.find_entry_by_external_ref(conn, req.external_ref) is not None
+            ):
+                raise DuplicateExternalRefError(
+                    f"external_ref {req.external_ref!r} is already registered "
+                    "on another ledger entry"
                 )
             refundable = payment.captured_amount - payment.refunded_amount
             if refundable <= 0:
@@ -288,18 +335,17 @@ class PaymentLedgerService:
             payment.refunded_amount += amount
             payment.status = _derive_status(payment)
             self.repo.update_payment(conn, payment)
-            return payment, EntryType.REFUND, amount
+            return payment, EntryType.REFUND, amount, req.external_ref
 
-        return self._run_idempotent(
-            "refund",
-            idempotency_key,
-            {
-                "payment_id": req.payment_id,
-                "amount": req.amount,
-                "currency": req.currency,
-            },
-            execute,
-        )
+        # See capture(): fingerprint stays identical for ref-less calls.
+        payload = {
+            "payment_id": req.payment_id,
+            "amount": req.amount,
+            "currency": req.currency,
+        }
+        if req.external_ref is not None:
+            payload["external_ref"] = req.external_ref
+        return self._run_idempotent("refund", idempotency_key, payload, execute)
 
     # -- reads ---------------------------------------------------------
 

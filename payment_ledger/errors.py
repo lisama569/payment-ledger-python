@@ -29,3 +29,7 @@ class InvalidAmountError(LedgerError):
 
 class IdempotencyConflictError(LedgerError):
     code = "idempotency_conflict"
+
+
+class DuplicateExternalRefError(LedgerError):
+    code = "duplicate_external_ref"

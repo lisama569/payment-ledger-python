@@ -61,6 +61,33 @@ CREATE TABLE IF NOT EXISTS idempotency (
     result_json     TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
+
+-- Reconciliation run journal: every run's conclusion is persisted so
+-- results survive restarts and consecutive runs can be diffed.
+-- This table is append-only and never touches ledger_entries.
+CREATE TABLE IF NOT EXISTS reconciliation_runs (
+    run_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at       TEXT NOT NULL,
+    scope_json       TEXT NOT NULL,
+    statement_hash   TEXT NOT NULL,
+    report_json      TEXT NOT NULL,
+    max_seq          INTEGER NOT NULL,
+    discrepancy_keys TEXT NOT NULL
+);
+"""
+
+# Columns added after the initial schema, applied idempotently.
+_MIGRATIONS = (
+    # Settlement reference registered on fund-moving entries.
+    "ALTER TABLE ledger_entries ADD COLUMN external_ref TEXT",
+)
+
+_POST_MIGRATION_SCHEMA = """
+-- A settlement reference may be attached to at most one ledger entry,
+-- across all payments. SQLite unique indexes treat NULLs as distinct,
+-- so legacy rows without a reference are unaffected.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_external_ref
+    ON ledger_entries(external_ref);
 """
 
 
@@ -98,6 +125,19 @@ class LedgerRepository:
             self._conn.execute("PRAGMA busy_timeout = 5000")
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.executescript(_SCHEMA)
+            self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
+        existing = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(ledger_entries)")
+        }
+        for statement in _MIGRATIONS:
+            # Each migration names its column after ADD COLUMN.
+            column = statement.rsplit(" ", 2)[-2]
+            if column not in existing:
+                self._conn.execute(statement)
+        self._conn.executescript(_POST_MIGRATION_SCHEMA)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -202,11 +242,20 @@ class LedgerRepository:
         currency: str,
         idempotency_key: str,
         created_at: str,
+        external_ref: str | None = None,
     ) -> LedgerEntry:
         cur = conn.execute(
             "INSERT INTO ledger_entries (payment_id, entry_type, amount, currency, "
-            "idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (payment_id, entry_type.value, amount, currency, idempotency_key, created_at),
+            "idempotency_key, created_at, external_ref) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                payment_id,
+                entry_type.value,
+                amount,
+                currency,
+                idempotency_key,
+                created_at,
+                external_ref,
+            ),
         )
         return LedgerEntry(
             seq=cur.lastrowid,
@@ -216,6 +265,30 @@ class LedgerRepository:
             currency=currency,
             idempotency_key=idempotency_key,
             created_at=created_at,
+            external_ref=external_ref,
+        )
+
+    def find_entry_by_external_ref(
+        self, conn: sqlite3.Connection, external_ref: str
+    ) -> LedgerEntry | None:
+        row = conn.execute(
+            "SELECT * FROM ledger_entries WHERE external_ref = ? ORDER BY seq",
+            (external_ref,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_entry(row)
+
+    def _row_to_entry(self, r: sqlite3.Row) -> LedgerEntry:
+        return LedgerEntry(
+            seq=r["seq"],
+            payment_id=r["payment_id"],
+            entry_type=EntryType(r["entry_type"]),
+            amount=r["amount"],
+            currency=r["currency"],
+            idempotency_key=r["idempotency_key"],
+            created_at=r["created_at"],
+            external_ref=r["external_ref"],
         )
 
     def list_entries(
@@ -230,18 +303,7 @@ class LedgerRepository:
                 "SELECT * FROM ledger_entries WHERE payment_id = ? ORDER BY seq",
                 (payment_id,),
             ).fetchall()
-        return [
-            LedgerEntry(
-                seq=r["seq"],
-                payment_id=r["payment_id"],
-                entry_type=EntryType(r["entry_type"]),
-                amount=r["amount"],
-                currency=r["currency"],
-                idempotency_key=r["idempotency_key"],
-                created_at=r["created_at"],
-            )
-            for r in rows
-        ]
+        return [self._row_to_entry(r) for r in rows]
 
     # -- idempotency ---------------------------------------------------
 
@@ -268,3 +330,51 @@ class LedgerRepository:
         if row is None:
             return None
         return row["request_hash"], row["result_json"]
+
+    # -- reconciliation run journal (append-only, separate from ledger) --
+
+    def insert_reconciliation_run(
+        self,
+        conn: sqlite3.Connection,
+        created_at: str,
+        scope_json: str,
+        statement_hash: str,
+        report_json: str,
+        max_seq: int,
+        discrepancy_keys: str,
+    ) -> int:
+        cur = conn.execute(
+            "INSERT INTO reconciliation_runs (created_at, scope_json, statement_hash, "
+            "report_json, max_seq, discrepancy_keys) VALUES (?, ?, ?, ?, ?, ?)",
+            (created_at, scope_json, statement_hash, report_json, max_seq, discrepancy_keys),
+        )
+        return cur.lastrowid
+
+    def _row_to_run(self, row: sqlite3.Row) -> dict:
+        return {
+            "run_id": row["run_id"],
+            "created_at": row["created_at"],
+            "scope_json": row["scope_json"],
+            "statement_hash": row["statement_hash"],
+            "report_json": row["report_json"],
+            "max_seq": row["max_seq"],
+            "discrepancy_keys": row["discrepancy_keys"],
+        }
+
+    def get_latest_run(self, conn: sqlite3.Connection) -> dict | None:
+        row = conn.execute(
+            "SELECT * FROM reconciliation_runs ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else self._row_to_run(row)
+
+    def get_run(self, conn: sqlite3.Connection, run_id: int) -> dict | None:
+        row = conn.execute(
+            "SELECT * FROM reconciliation_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_run(row)
+
+    def list_runs(self, conn: sqlite3.Connection) -> list[dict]:
+        rows = conn.execute(
+            "SELECT * FROM reconciliation_runs ORDER BY run_id"
+        ).fetchall()
+        return [self._row_to_run(r) for r in rows]

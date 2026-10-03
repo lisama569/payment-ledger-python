@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from .errors import (
     AmountExceededError,
     CurrencyMismatchError,
+    DuplicateExternalRefError,
     IdempotencyConflictError,
     InvalidAmountError,
     InvalidStateTransitionError,
@@ -23,7 +24,7 @@ from .models import (
     RefundRequest,
 )
 from .reconciliation import Reconciler
-from .reconciliation_types import SettlementRecord
+from .reconciliation_types import ReconcileScope, SettlementRecord
 from .repository import LedgerRepository
 from .service import PaymentLedgerService
 
@@ -36,6 +37,7 @@ _HTTP_STATUS = {
     CurrencyMismatchError: 422,
     InvalidAmountError: 400,
     IdempotencyConflictError: 409,
+    DuplicateExternalRefError: 409,
 }
 
 
@@ -48,11 +50,15 @@ class AuthorizeBody(BaseModel):
 class CaptureBody(BaseModel):
     amount: int | None = Field(default=None, strict=True)
     currency: str
+    # Optional settlement-system reference for this fund movement.
+    external_ref: str | None = None
 
 
 class RefundBody(BaseModel):
     amount: int | None = Field(default=None, strict=True)
     currency: str
+    # Optional settlement-system reference for this fund movement.
+    external_ref: str | None = None
 
 
 class SettlementLine(BaseModel):
@@ -65,6 +71,13 @@ class SettlementLine(BaseModel):
 
 class ReconcileBody(BaseModel):
     statement: list[SettlementLine]
+    # Optional scoping: restrict which ledger entries this run looks at.
+    since_seq: int | None = None
+    until_seq: int | None = None
+    since_time: str | None = None
+    until_time: str | None = None
+    # "incremental" reconciles only entries after the previous run.
+    mode: str = "full"
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -106,7 +119,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     ):
         try:
             result = service.capture(
-                CaptureRequest(payment_id, body.amount, body.currency),
+                CaptureRequest(payment_id, body.amount, body.currency, body.external_ref),
                 idempotency_key,
             )
         except LedgerError as exc:
@@ -121,7 +134,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     ):
         try:
             result = service.refund(
-                RefundRequest(payment_id, body.amount, body.currency),
+                RefundRequest(payment_id, body.amount, body.currency, body.external_ref),
                 idempotency_key,
             )
         except LedgerError as exc:
@@ -150,9 +163,37 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "currency": e.currency,
                     "idempotency_key": e.idempotency_key,
                     "created_at": e.created_at,
+                    "external_ref": e.external_ref,
                 }
                 for e in payment.entries
 
+            ],
+        }
+
+    def item_to_dict(item) -> dict:
+        return {
+            "discrepancy": item.discrepancy.value if item.discrepancy else None,
+            "external_ref": item.external_ref,
+            "payment_id": item.payment_id,
+            "entry_type": item.entry_type.value,
+            "ledger_amount": item.ledger_amount,
+            "statement_amount": item.statement_amount,
+            "currency": item.currency,
+            "detail": item.detail,
+            "ledger_seq": item.ledger_seq,
+        }
+
+    def report_to_dict(report) -> dict:
+        return {
+            "run_id": report.run_id,
+            "matched": [item_to_dict(m) for m in report.matched],
+            "discrepancies": [item_to_dict(d) for d in report.discrepancies],
+            "new_discrepancies": [item_to_dict(d) for d in report.new_discrepancies],
+            "ongoing_discrepancies": [
+                item_to_dict(d) for d in report.ongoing_discrepancies
+            ],
+            "resolved_discrepancies": [
+                item_to_dict(d) for d in report.resolved_discrepancies
             ],
         }
 
@@ -168,17 +209,46 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
             for line in body.statement
         ]
-        report = reconciler.reconcile(statement)
+        if body.mode == "incremental":
+            report = reconciler.reconcile_incremental(statement)
+        elif body.mode == "full":
+            scope = ReconcileScope(
+                since_seq=body.since_seq,
+                until_seq=body.until_seq,
+                since_time=body.since_time,
+                until_time=body.until_time,
+            )
+            report = reconciler.reconcile(statement, scope=scope)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_amount", "message": f"unknown reconcile mode {body.mode!r}"},
+            )
+        return report_to_dict(report)
+
+    @app.get("/v1/reconcile/runs")
+    def list_reconcile_runs():
+        return {"runs": reconciler.list_runs()}
+
+    @app.get("/v1/reconcile/runs/{run_id}")
+    def get_reconcile_run(run_id: int):
+        run = reconciler.get_run(run_id)
+        if run is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "payment_not_found", "message": f"reconcile run {run_id} not found"},
+            )
         return {
-            "matched": [asdict(m) | {"entry_type": m.entry_type.value, "discrepancy": None} for m in report.matched],
-            "discrepancies": [
-                {
-                    **asdict(d),
-                    "entry_type": d.entry_type.value,
-                    "discrepancy": d.discrepancy.value if d.discrepancy else None,
-                }
-                for d in report.discrepancies
-            ],
+            "run_id": run["run_id"],
+            "created_at": run["created_at"],
+            "scope": run["scope"],
+            "statement_hash": run["statement_hash"],
+            "max_seq": run["max_seq"],
+            "matched": [item_to_dict(m) for m in run["matched"]],
+            "discrepancies": [item_to_dict(d) for d in run["discrepancies"]],
+            "new_discrepancies": [item_to_dict(d) for d in run["new_discrepancies"]],
+            "ongoing_discrepancies": [item_to_dict(d) for d in run["ongoing_discrepancies"]],
+            "resolved_discrepancies": [item_to_dict(d) for d in run["resolved_discrepancies"]],
         }
 
     return app

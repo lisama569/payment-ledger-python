@@ -127,6 +127,64 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 422)
 
+    def test_external_ref_registration_and_run_journal_over_http(self):
+        c = self.client
+        c.post(
+            "/v1/payments/authorize",
+            json={"payment_id": "p1", "amount": 10000, "currency": "USD"},
+            headers={"Idempotency-Key": "k-a"},
+        )
+        log.info("HTTP capture idempotency_key=k-c1 request=%s",
+                 {"amount": 4000, "currency": "USD", "external_ref": "ST-1"})
+        r = c.post(
+            "/v1/payments/p1/capture",
+            json={"amount": 4000, "currency": "USD", "external_ref": "ST-1"},
+            headers={"Idempotency-Key": "k-c1"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["external_ref"], "ST-1")
+
+        # reusing the same settlement reference -> 409 duplicate_external_ref
+        r = c.post(
+            "/v1/payments/p1/capture",
+            json={"amount": 1000, "currency": "USD", "external_ref": "ST-1"},
+            headers={"Idempotency-Key": "k-c2"},
+        )
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["code"], "duplicate_external_ref")
+        log.info("HTTP duplicate external_ref rejected code=%s",
+                 r.json()["detail"]["code"])
+
+        # entry carries the reference
+        entries = c.get("/v1/payments/p1").json()["entries"]
+        capture = [e for e in entries if e["entry_type"] == "CAPTURE"][0]
+        self.assertEqual(capture["external_ref"], "ST-1")
+
+        # reconcile by reference; run is journaled
+        rec = c.post(
+            "/v1/reconcile",
+            json={"statement": [
+                {"external_ref": "ST-1", "payment_id": "p1", "entry_type": "CAPTURE",
+                 "amount": 4000, "currency": "USD"},
+            ]},
+        )
+        self.assertEqual(rec.status_code, 200)
+        body = rec.json()
+        self.assertEqual(len(body["matched"]), 1)
+        self.assertEqual(body["discrepancies"], [])
+        run_id = body["run_id"]
+        self.assertIsNotNone(run_id)
+
+        runs = c.get("/v1/reconcile/runs").json()["runs"]
+        self.assertEqual([r["run_id"] for r in runs], [run_id])
+        run = c.get(f"/v1/reconcile/runs/{run_id}").json()
+        self.assertEqual(len(run["matched"]), 1)
+        log.info("HTTP reconcile run=%s matched=%d", run_id, len(run["matched"]))
+
+        # incremental mode is accepted
+        rec2 = c.post("/v1/reconcile", json={"statement": [], "mode": "incremental"})
+        self.assertEqual(rec2.status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()
