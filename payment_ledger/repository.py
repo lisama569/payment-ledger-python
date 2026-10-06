@@ -382,9 +382,17 @@ class LedgerRepository:
         return [self._row_to_run(r) for r in rows]
 
     def latest_run_max_seq(self, conn: sqlite3.Connection) -> int | None:
-        """Highest ledger seq covered by the most recent recorded run."""
+        """Monotonic high-water mark: highest ledger seq any recorded run
+        has covered up to.
+
+        This is intentionally ``MAX(max_seq)`` over every run rather than
+        the ``max_seq`` of the most recently inserted row: an incremental
+        run whose window contained no entries must keep the previous
+        position, and a concurrent run that committed later must never be
+        able to move the position back to an earlier seq.
+        """
         row = conn.execute(
-            "SELECT max_seq FROM reconciliation_runs ORDER BY run_id DESC LIMIT 1"
+            "SELECT MAX(max_seq) AS max_seq FROM reconciliation_runs"
         ).fetchone()
         return None if row is None else row["max_seq"]
 

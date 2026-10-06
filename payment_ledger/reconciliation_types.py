@@ -57,7 +57,11 @@ class ReconciliationScope:
     * ``from_time`` / ``to_time``: only entries created inside
       ``[from_time, to_time]`` (ISO-8601 strings, e.g. one business day).
     * ``incremental``: start right after the entry covered by the most
-      recent recorded run (resolves to a concrete ``from_seq``).
+      recent recorded run (resolves to a concrete ``from_seq``). The
+      recorded high-water mark is monotonic: an incremental run whose
+      window contains no new entries keeps the previous ``from_seq``
+      rather than resetting it, and concurrent runs never move the
+      position backwards.
     """
 
     from_seq: int | None = None

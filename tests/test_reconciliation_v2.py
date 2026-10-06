@@ -23,7 +23,7 @@ from payment_ledger.reconciliation_types import (
     item_signature,
 )
 
-from .support import LedgerTestCase, log, reopen_service
+from .support import LedgerTestCase, log, log_request, reopen_service
 
 log = logging.getLogger("payment_ledger.tests")
 
@@ -31,11 +31,17 @@ log = logging.getLogger("payment_ledger.tests")
 def seed_with_refs(svc) -> None:
     """p1: capture 4000 (S1) + legacy capture 3000 (no ref), refund 1000 (S2);
     p2: capture 5000 (S3)."""
+    log_request("seed-authorize", "a1", {"payment_id": "p1", "amount": 10000, "currency": "USD"})
     svc.authorize(AuthorizeRequest("p1", 10000, "USD"), "a1")
+    log_request("seed-capture", "c1", {"payment_id": "p1", "amount": 4000, "currency": "USD", "external_ref": "S1"})
     svc.capture(CaptureRequest("p1", 4000, "USD", external_ref="S1"), "c1")
+    log_request("seed-capture", "c2", {"payment_id": "p1", "amount": 3000, "currency": "USD", "external_ref": None})
     svc.capture(CaptureRequest("p1", 3000, "USD"), "c2")  # legacy entry, no ref
+    log_request("seed-refund", "r1", {"payment_id": "p1", "amount": 1000, "currency": "USD", "external_ref": "S2"})
     svc.refund(RefundRequest("p1", 1000, "USD", external_ref="S2"), "r1")
+    log_request("seed-authorize", "a2", {"payment_id": "p2", "amount": 5000, "currency": "USD"})
     svc.authorize(AuthorizeRequest("p2", 5000, "USD"), "a2")
+    log_request("seed-capture", "c3", {"payment_id": "p2", "amount": 5000, "currency": "USD", "external_ref": "S3"})
     svc.capture(CaptureRequest("p2", 5000, "USD", external_ref="S3"), "c3")
 
 
@@ -145,10 +151,15 @@ class ReconciliationV2Tests(LedgerTestCase):
     def _seed_ref_only(self):
         """All money entries carry refs: p1 S1(4000), S2(3000); p2 S3(5000, mismatched)."""
         svc = self.service
+        log_request("seed-authorize", "a1", {"payment_id": "p1", "amount": 10000, "currency": "USD"})
         svc.authorize(AuthorizeRequest("p1", 10000, "USD"), "a1")
+        log_request("seed-capture", "c1", {"payment_id": "p1", "amount": 4000, "currency": "USD", "external_ref": "S1"})
         svc.capture(CaptureRequest("p1", 4000, "USD", external_ref="S1"), "c1")
+        log_request("seed-capture", "c2", {"payment_id": "p1", "amount": 3000, "currency": "USD", "external_ref": "S2"})
         svc.capture(CaptureRequest("p1", 3000, "USD", external_ref="S2"), "c2")
+        log_request("seed-authorize", "a2", {"payment_id": "p2", "amount": 5000, "currency": "USD"})
         svc.authorize(AuthorizeRequest("p2", 5000, "USD"), "a2")
+        log_request("seed-capture", "c3", {"payment_id": "p2", "amount": 5000, "currency": "USD", "external_ref": "S3"})
         svc.capture(CaptureRequest("p2", 5000, "USD", external_ref="S3"), "c3")
 
     def _ref_statement(self):

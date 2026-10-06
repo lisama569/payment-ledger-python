@@ -35,6 +35,14 @@ since the previous recorded run (incremental). Because filtering is by
 entry attributes, a windowed/incremental run reaches the same
 conclusions for its entries as a full run restricted to the same range.
 
+The incremental high-water mark (``max_seq`` stored with each run) is
+monotonic: the next run starts after ``MAX(max_seq)`` over all recorded
+runs, and a run whose window contains no entries (an empty scheduled
+run on a business day without fund movements) records the previous
+position unchanged instead of resetting it. The recorded value is
+clamped to the existing mark, so concurrent runs cannot move the
+position backwards; every run is append-only.
+
 Every recorded run is persisted with its resolved scope and a digest of
 the statement, so the same inputs after a restart reproduce the same
 conclusion, and two consecutive runs can be diffed into new /
@@ -318,19 +326,34 @@ class Reconciler:
 
     # -- recorded runs ---------------------------------------------------
 
-    def _resolve_scope(self, scope: ReconciliationScope) -> ReconciliationScope:
-        """Turn an incremental scope into a concrete seq window."""
+    def _resolve_scope(
+        self, scope: ReconciliationScope, conn=None
+    ) -> ReconciliationScope:
+        """Turn an incremental scope into a concrete seq window.
+
+        When ``conn`` is given the current high-water mark is read inside
+        that (write) transaction, so the resolved window is always based
+        on the latest committed position. Advancement itself is made
+        monotonic by clamping the recorded value and reading the mark as
+        ``MAX(max_seq)`` (see ``reconcile_and_record``).
+        """
         if not scope.incremental:
             return scope
+
+        def _resolve(c):
+            last = self.repo.latest_run_max_seq(c)
+            return ReconciliationScope(
+                from_seq=last if last is not None else scope.from_seq,
+                to_seq=scope.to_seq,
+                from_time=scope.from_time,
+                to_time=scope.to_time,
+                incremental=True,
+            )
+
+        if conn is not None:
+            return _resolve(conn)
         with self.repo.transaction() as conn:
-            last = self.repo.latest_run_max_seq(conn)
-        return ReconciliationScope(
-            from_seq=last if last is not None else scope.from_seq,
-            to_seq=scope.to_seq,
-            from_time=scope.from_time,
-            to_time=scope.to_time,
-            incremental=True,
-        )
+            return _resolve(conn)
 
     def reconcile_and_record(
         self,
@@ -339,31 +362,74 @@ class Reconciler:
     ) -> ReconciliationRun:
         """Reconcile and persist the conclusion as a new run.
 
-        Concurrent callers are serialized by the repository write lock;
-        each run lands as its own append-only row, and the fund-movement
-        tables are never written.
+        Concurrency and position advancement are kept consistent without
+        holding the database write lock for the whole (read-only)
+        matching pass -- that would block fund writes on the same file:
+
+        * both the window resolution and the run insert are short
+          ``BEGIN IMMEDIATE`` transactions serialized by the repository
+          write lock, so concurrent reconcilers commit one row at a time;
+        * the recorded ``max_seq`` is clamped to the existing high-water
+          mark and the repository reads the mark as ``MAX(max_seq)`` over
+          all runs, so a concurrent or late-committing run -- and an
+          empty window -- can never move the position backwards or make
+          the next run reopen already-reconciled entries. At worst two
+          concurrent runs cover the same window and append two
+          equivalent rows; the fund-movement tables are never written.
+
+        The recorded ``max_seq`` is a monotonic high-water mark. In
+        particular an empty incremental window (no new entries, e.g. a
+        scheduled run on a business day without fund movements) records
+        the previous position unchanged, so the next run does not reopen
+        already-reconciled entries.
         """
-        resolved = self._resolve_scope(scope or ReconciliationScope())
-        # Load entries once so the recorded max_seq covers exactly the
-        # entries this conclusion was computed from.
+        requested = scope or ReconciliationScope()
+        digest = statement_digest(statement)
+        created_at = utc_now_iso()
+
+        # Short write transaction: resolve the window against the
+        # committed high-water mark. Ledger entries are append-only and
+        # never updated or deleted, so the window stays valid while the
+        # read-only matching below runs without blocking fund writers.
+        with self.repo.transaction() as conn:
+            resolved = self._resolve_scope(requested, conn)
+            previous_watermark = self.repo.latest_run_max_seq(conn)
+
+        # Ledger reads go through the separate read-only connection; the
+        # append-only ledger cannot change between release and re-acquire
+        # of the write lock (entries are never updated or deleted), and
+        # the watermark is clamped below so a concurrent run can never
+        # move the position backwards.
         entries = self._load_entries(resolved)
         report = self._match(entries, statement)
-        max_seq = max((e.seq for e in entries), default=resolved.to_seq or 0)
+        window_max_seq = max(
+            (e.seq for e in entries), default=resolved.to_seq
+        )
+        if window_max_seq is None:
+            # Empty open-ended window: stay exactly where we were.
+            max_seq = previous_watermark or 0
+        elif previous_watermark is not None:
+            # Never move the position backwards (empty windows, late
+            # concurrent writers, to_seq before the old watermark).
+            max_seq = max(previous_watermark, window_max_seq)
+        else:
+            max_seq = window_max_seq
+
         with self.repo.transaction() as conn:
             run_id = self.repo.save_reconciliation_run(
                 conn,
                 resolved,
-                statement_digest(statement),
+                digest,
                 max_seq,
                 report.matched,
                 report.discrepancies,
-                utc_now_iso(),
+                created_at,
             )
         return ReconciliationRun(
             run_id=run_id,
-            created_at=utc_now_iso(),
+            created_at=created_at,
             scope=resolved,
-            statement_digest=statement_digest(statement),
+            statement_digest=digest,
             matched=report.matched,
             discrepancies=report.discrepancies,
         )

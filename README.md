@@ -103,6 +103,7 @@ PYTHONPATH=. python3 -m unittest tests.test_concurrency -v        # 并发重复
 PYTHONPATH=. python3 -m unittest tests.test_ledger -v             # 状态机/部分金额/幂等重放/重启
 PYTHONPATH=. python3 -m unittest tests.test_reconciliation -v     # 三类对账差异 + 只读保证
 PYTHONPATH=. python3 -m unittest tests.test_reconciliation_v2 -v  # 流水号配对/窗口增量/留痕/差异变化
+PYTHONPATH=. python3 -m unittest tests.test_incremental_reconciliation -v  # 空跑保水位/反复空跑/并发增量/重启复跑
 PYTHONPATH=. python3 -m unittest tests.test_external_ref -v       # 对外流水号登记与兼容
 PYTHONPATH=. python3 -m unittest tests.test_api -v                # HTTP 端到端
 ```
@@ -116,7 +117,7 @@ STEP=capture-over | idempotency_key=k-cx | request={'payment_id': 'p3', 'amount'
 JUDGEMENT=REJECTED | reason_code=invalid_state_transition | message=payment 'p3' is already fully captured
 ```
 
-测试覆盖（共 44 个）：
+测试覆盖（共 49 个）：
 
 | 测试文件 | 覆盖内容 |
 | --- | --- |
@@ -125,7 +126,41 @@ JUDGEMENT=REJECTED | reason_code=invalid_state_transition | message=payment 'p3'
 | `tests/test_reconciliation.py` | 金额不一致 / 缺失入账 / 重复入账三类可区分差异、三类并存、币种不一致、对账前后流水逐字节不变（严格只读） |
 | `tests/test_external_ref.py` | 捕获/退款登记对外流水号、同一流水号同支付单与跨支付单均拒绝（捕获与退款之间也互斥）、拒绝后幂等键不被占用可修正重试、不带流水号的老调用照旧、**升级前落过的幂等键重放结论一致**、带/不带流水号重启重放 |
 | `tests/test_reconciliation_v2.py` | 带流水号与不带流水号混着对账、按流水号配对后比金额币种、两个方向的单向差异可区分、同一流水号在对账单中重复使用、窗口/增量与全量结论一致、时间窗对账、连续两次运行的新增/存在/消除差异、留痕运行重启后可复跑且结论一致、8 线程并发对账互不干扰且流水不变 |
+| `tests/test_incremental_reconciliation.py` | **空增量窗口（营业日无资金动作）后再来新流水，只覆盖新流水且与同范围全量结论逐项一致**、连续多次反复空跑水位不丢、8 线程并发空跑/并发增量推进位置不回退且资金流水逐字段不变、空跑后重启复跑结论一致 |
 | `tests/test_api.py` | HTTP 全链路、可区分错误码、浮点金额被请求校验拒绝、缺少幂等头被拒绝、对账端点只读、对外流水号 HTTP 流程与 409 拒绝、对账留痕与 diff 端点 |
+
+### 本地复现/验证“空跑导致老流水被重报”的修复
+
+```bash
+# 只跑增量高水位相关用例（含空跑→新流水、反复空跑、并发与重启复跑）
+PYTHONPATH=. python3 -m unittest tests.test_incremental_reconciliation -v
+
+# 全量回归
+PYTHONPATH=. python3 -m unittest discover -t . -s tests -v
+```
+
+手工按 HTTP 复现（修复前：第 4 步会把 S1/S3 重新报成 `MISSING_IN_STATEMENT`；
+修复后：只输出 S4 匹配，且水位停留在空跑前的位置）：
+
+```bash
+# 1) 先有两笔捕获（其中 S3 与对账单金额不一致），做一次留痕对账，确认水位
+curl -s -X POST localhost:8000/v1/payments/P1/authorize -H 'Idempotency-Key: k-a1' \
+  -H 'Content-Type: application/json' -d '{"payment_id":"P1","amount":10000,"currency":"USD"}'
+curl -s -X POST localhost:8000/v1/payments/P1/capture -H 'Idempotency-Key: k-c1' \
+  -H 'Content-Type: application/json' -d '{"amount":4000,"currency":"USD","external_ref":"S1"}'
+curl -s -X POST localhost:8000/v1/reconcile -H 'Content-Type: application/json' \
+  -d '{"statement":[{"external_ref":"S1","payment_id":"P1","entry_type":"CAPTURE","amount":4000,"currency":"USD"}],"record":true}'
+# 2) 营业日无新资金动作，定时任务照常跑一次空增量（对账单为空）
+curl -s -X POST localhost:8000/v1/reconcile -H 'Content-Type: application/json' \
+  -d '{"statement":[],"scope":{"incremental":true},"record":true}'
+# 3) 查看历史运行：空跑这行的 scope.from_seq 与上一行 max_seq 相同（水位未退）
+curl -s localhost:8000/v1/reconcile/runs
+# 4) 新增一笔捕获后再跑增量：只配对 S4，不会重报 S1
+curl -s -X POST localhost:8000/v1/payments/P1/capture -H 'Idempotency-Key: k-c2' \
+  -H 'Content-Type: application/json' -d '{"amount":3000,"currency":"USD","external_ref":"S4"}'
+curl -s -X POST localhost:8000/v1/reconcile -H 'Content-Type: application/json' \
+  -d '{"statement":[{"external_ref":"S4","payment_id":"P1","entry_type":"CAPTURE","amount":3000,"currency":"USD"}],"scope":{"incremental":true},"record":true}'
+```
 
 ---
 
@@ -240,8 +275,25 @@ CAPTURED / PARTIALLY_CAPTURED ──refund(部分)──► PARTIALLY_REFUNDED
 - **窗口对账**：`scope` 支持 `from_seq`/`to_seq`（按账务流水号）与
   `from_time`/`to_time`（按入账时间，可圈定某个营业日），只覆盖范围内的流水。
 - **增量对账**：`"scope": {"incremental": true}` 自动从上次留痕运行覆盖到的最大
-  `seq` 之后开始。因为过滤只按流水自身属性（seq/时间），窗口/增量跑出的结论与
+  `seq` 之后开始（解析为具体的 `from_seq`，只覆盖 `from_seq < seq` 的资金流水）。
+  因为过滤只按流水自身属性（seq/时间），窗口/增量跑出的结论与
   全量对账在同一范围内的结论一致（有一致性测试逐项比对）。
+
+  **“上次对到哪”的推进与保留（高水位）**：每次留痕运行都会记录本次覆盖到的
+  最大资金流水号 `max_seq`，下一次增量以 `MAX(max_seq)`（所有历史运行中的最大值，
+  而非“最后一行”的值）作为起点。该水位**只进不退**：
+
+  - **空跑保留位置**：某次增量覆盖的窗口里没有任何新流水（例如某营业日没有任何
+    资金动作、定时任务照常跑了一次）时，本次结论为空，落库的 `max_seq`
+    原样保留上一次的水位。因此空跑之后再来新流水，下一次增量只会覆盖水位之后新
+    产生的流水，之前已对上的老流水不会被重新配对或重新报差异；连续多次、反复
+    空跑行为一致。
+  - **并发不回退**：水位读取（`SELECT MAX(max_seq)`）与运行落库都在串行化的
+    `BEGIN IMMEDIATE` 短写事务中完成，且落库值会与已有水位取最大值钳制，
+    并发发起的增量对账不可能把推进位置覆盖成更早的值；流水为 append-only，
+    匹配计算期间不会有资金写入被阻塞或改动。
+  - **重启可复现**：水位与每次结论一并持久化在 `reconciliation_runs` 表，
+    进程重启后用同样的对账单与范围复跑，结论逐项一致。
 - **连续两次运行的差异变化**：`GET /v1/reconcile/diff?older=A&newer=B`
   （或服务端 `diff_runs`）把两次留痕的差异项按稳定签名比对，输出
   `new_discrepancies`（这次新冒出来）、`persisting_discrepancies`（仍存在）、
