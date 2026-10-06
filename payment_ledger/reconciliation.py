@@ -35,10 +35,23 @@ since the previous recorded run (incremental). Because filtering is by
 entry attributes, a windowed/incremental run reaches the same
 conclusions for its entries as a full run restricted to the same range.
 
+The "last covered" position of a recorded run is its ``max_seq``: the
+highest ledger seq its conclusion was computed from. An incremental run
+resolves to ``last_max_seq < seq``, so only genuinely new entries are
+paired. An empty incremental window (e.g. a scheduled run on a business
+day with no new fund movements) must NOT reset that position: the run is
+recorded with the previous ``max_seq`` preserved (an explicit
+``to_seq`` still advances it), so the next incremental run continues
+right after the already-covered entries instead of re-pairing them.
+
 Every recorded run is persisted with its resolved scope and a digest of
 the statement, so the same inputs after a restart reproduce the same
 conclusion, and two consecutive runs can be diffed into new /
-persisting / resolved discrepancies.
+persisting / resolved discrepancies. Resolving the incremental
+starting position, computing the conclusion and persisting it all happen
+inside one write transaction, so concurrent incremental runs are
+serialized: a run can never overwrite the checkpoint with an earlier
+position, and fund-movement tables are never touched.
 """
 from __future__ import annotations
 
@@ -318,12 +331,19 @@ class Reconciler:
 
     # -- recorded runs ---------------------------------------------------
 
-    def _resolve_scope(self, scope: ReconciliationScope) -> ReconciliationScope:
-        """Turn an incremental scope into a concrete seq window."""
+    def _resolve_scope(
+        self, scope: ReconciliationScope, conn
+    ) -> ReconciliationScope:
+        """Turn an incremental scope into a concrete seq window.
+
+        Reads the current checkpoint on the caller's connection (inside
+        the write transaction for recorded runs), so the starting
+        position can never be observed stale relative to what gets
+        committed at the end of that same transaction.
+        """
         if not scope.incremental:
             return scope
-        with self.repo.transaction() as conn:
-            last = self.repo.latest_run_max_seq(conn)
+        last = self.repo.latest_run_max_seq(conn)
         return ReconciliationScope(
             from_seq=last if last is not None else scope.from_seq,
             to_seq=scope.to_seq,
@@ -332,6 +352,26 @@ class Reconciler:
             incremental=True,
         )
 
+    @staticmethod
+    def _covered_max_seq(
+        entries: list[LedgerEntry], scope: ReconciliationScope
+    ) -> int:
+        """The "last covered" checkpoint this run advances to.
+
+        With in-scope entries it is the highest seq the conclusion was
+        computed from. With no in-scope entries the position must not
+        move backwards: an incremental run that found nothing new keeps
+        the checkpoint it started after (``from_seq``), while an explicit
+        ``to_seq`` still advances it. This is what lets a scheduled run
+        on a business day without any new fund movement be a harmless
+        no-op for the next incremental run.
+        """
+        if entries:
+            return max(e.seq for e in entries)
+        if scope.to_seq is not None:
+            return scope.to_seq
+        return scope.from_seq if scope.from_seq is not None else 0
+
     def reconcile_and_record(
         self,
         statement: list[SettlementRecord],
@@ -339,16 +379,65 @@ class Reconciler:
     ) -> ReconciliationRun:
         """Reconcile and persist the conclusion as a new run.
 
-        Concurrent callers are serialized by the repository write lock;
-        each run lands as its own append-only row, and the fund-movement
-        tables are never written.
+        For incremental runs, resolving the starting checkpoint,
+        loading/computing the conclusion and persisting it all happen in
+        one write transaction. Concurrent callers are therefore
+        serialized: each run lands as its own append-only row, no run can
+        overwrite the checkpoint with an earlier value, and the
+        fund-movement tables are never written.
         """
-        resolved = self._resolve_scope(scope or ReconciliationScope())
+        requested = scope or ReconciliationScope()
+        if not requested.incremental:
+            return self._record_once(requested, statement)
+
+        # The resolve -> compute -> persist critical section must be
+        # atomic w.r.t. other recorded runs. Re-validate the starting
+        # position after taking the write lock; if another run committed
+        # first, recompute against the advanced checkpoint instead of
+        # covering its entries again or recording an earlier position.
+        with self.repo.transaction() as conn:
+            while True:
+                resolved = self._resolve_scope(requested, conn)
+                entries = self._load_entries(resolved)
+                report = self._match(entries, statement)
+                max_seq = self._covered_max_seq(entries, resolved)
+                latest = self.repo.latest_run_max_seq(conn)
+                if latest is not None and latest > max_seq:
+                    # Another run advanced the checkpoint while we were
+                    # waiting; restart against the new position.
+                    continue
+                run_id = self.repo.save_reconciliation_run(
+                    conn,
+                    resolved,
+                    statement_digest(statement),
+                    max_seq,
+                    report.matched,
+                    report.discrepancies,
+                    utc_now_iso(),
+                )
+                saved = ReconciliationRun(
+                    run_id=run_id,
+                    created_at=utc_now_iso(),
+                    scope=resolved,
+                    statement_digest=statement_digest(statement),
+                    matched=report.matched,
+                    discrepancies=report.discrepancies,
+                )
+                return saved
+
+    def _record_once(
+        self,
+        scope: ReconciliationScope,
+        statement: list[SettlementRecord],
+    ) -> ReconciliationRun:
+        """Non-incremental recorded run: resolve/compute, then persist."""
+        # Non-incremental scopes are already concrete.
+        resolved = scope
         # Load entries once so the recorded max_seq covers exactly the
         # entries this conclusion was computed from.
         entries = self._load_entries(resolved)
         report = self._match(entries, statement)
-        max_seq = max((e.seq for e in entries), default=resolved.to_seq or 0)
+        max_seq = self._covered_max_seq(entries, resolved)
         with self.repo.transaction() as conn:
             run_id = self.repo.save_reconciliation_run(
                 conn,

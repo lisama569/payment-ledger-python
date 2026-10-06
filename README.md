@@ -103,6 +103,7 @@ PYTHONPATH=. python3 -m unittest tests.test_concurrency -v        # 并发重复
 PYTHONPATH=. python3 -m unittest tests.test_ledger -v             # 状态机/部分金额/幂等重放/重启
 PYTHONPATH=. python3 -m unittest tests.test_reconciliation -v     # 三类对账差异 + 只读保证
 PYTHONPATH=. python3 -m unittest tests.test_reconciliation_v2 -v  # 流水号配对/窗口增量/留痕/差异变化
+PYTHONPATH=. python3 -m unittest tests.test_incremental_checkpoint -v  # 空增量水位保留/重启/并发增量
 PYTHONPATH=. python3 -m unittest tests.test_external_ref -v       # 对外流水号登记与兼容
 PYTHONPATH=. python3 -m unittest tests.test_api -v                # HTTP 端到端
 ```
@@ -116,7 +117,7 @@ STEP=capture-over | idempotency_key=k-cx | request={'payment_id': 'p3', 'amount'
 JUDGEMENT=REJECTED | reason_code=invalid_state_transition | message=payment 'p3' is already fully captured
 ```
 
-测试覆盖（共 44 个）：
+测试覆盖（共 49 个）：
 
 | 测试文件 | 覆盖内容 |
 | --- | --- |
@@ -125,6 +126,7 @@ JUDGEMENT=REJECTED | reason_code=invalid_state_transition | message=payment 'p3'
 | `tests/test_reconciliation.py` | 金额不一致 / 缺失入账 / 重复入账三类可区分差异、三类并存、币种不一致、对账前后流水逐字节不变（严格只读） |
 | `tests/test_external_ref.py` | 捕获/退款登记对外流水号、同一流水号同支付单与跨支付单均拒绝（捕获与退款之间也互斥）、拒绝后幂等键不被占用可修正重试、不带流水号的老调用照旧、**升级前落过的幂等键重放结论一致**、带/不带流水号重启重放 |
 | `tests/test_reconciliation_v2.py` | 带流水号与不带流水号混着对账、按流水号配对后比金额币种、两个方向的单向差异可区分、同一流水号在对账单中重复使用、窗口/增量与全量结论一致、时间窗对账、连续两次运行的新增/存在/消除差异、留痕运行重启后可复跑且结论一致、8 线程并发对账互不干扰且流水不变 |
+| `tests/test_incremental_checkpoint.py` | **空增量窗口之后再来新流水**的增量场景且与同范围全量逐项一致、空窗口携带对账单行（`MISSING_IN_LEDGER` 两方向口径一致）、连续多次空跑水位稳定、空跑后重启再增量只覆盖新流水、8 线程并发增量对账水位只进不退且资金流水不变 |
 | `tests/test_api.py` | HTTP 全链路、可区分错误码、浮点金额被请求校验拒绝、缺少幂等头被拒绝、对账端点只读、对外流水号 HTTP 流程与 409 拒绝、对账留痕与 diff 端点 |
 
 ---
@@ -240,15 +242,50 @@ CAPTURED / PARTIALLY_CAPTURED ──refund(部分)──► PARTIALLY_REFUNDED
 - **窗口对账**：`scope` 支持 `from_seq`/`to_seq`（按账务流水号）与
   `from_time`/`to_time`（按入账时间，可圈定某个营业日），只覆盖范围内的流水。
 - **增量对账**：`"scope": {"incremental": true}` 自动从上次留痕运行覆盖到的最大
-  `seq` 之后开始。因为过滤只按流水自身属性（seq/时间），窗口/增量跑出的结论与
-  全量对账在同一范围内的结论一致（有一致性测试逐项比对）。
+  `seq`（水位 `max_seq`，即该次结论所覆盖的最高账务流水号）**之后**开始，解析为
+  具体窗口 `last_max_seq < seq`。因为过滤只按流水自身属性（seq/时间），窗口/增量
+  跑出的结论与全量对账在同一范围内的结论一致（有一致性测试逐项比对）。
+- **水位怎么推进与保留**：一次留痕运行的水位取“本次窗口内实际覆盖到的最高 `seq`”；
+  窗口内没有任何可对流水时，**水位保持在本次起点（上次的 `max_seq`）不动**，只有显式
+  给定 `to_seq` 的空窗口才会把水位推进到 `to_seq`。因此某个营业日没有任何新资金动作、
+  定时任务照常空跑一次时，不会把“上次对到哪”丢掉；之后再来新流水继续增量，仍然只覆盖
+  `last_max_seq` 之后新增的那部分，已经对上的老流水不会被重新配对或重新报差异，
+  连续多次、反复空跑行为也保持一致。空跑本身仍是一条 append-only 运行记录
+  （结论为空），其结论与把全量对账限定在同一空范围内的结论逐项一致；空窗口里若仍带了
+  对账单行，会照常报 `MISSING_IN_LEDGER`，口径与全量限定范围相同。
+- **水位与结论同事务落库**：增量对账“读取上次水位 → 解析窗口 → 计算结论 → 落运行记录
+  与新水位”在同一个写事务内完成（进程内由仓储写锁串行化，跨进程由 SQLite 写锁 +
+  `busy_timeout` 串行化）。并发发起增量对账时，先拿锁的运行覆盖新窗口并推进水位，
+  其余运行拿锁后读到的是已推进的水位，只会在新的（空）窗口上落结论；**任何运行都不会
+  把水位覆盖成更早的值**，也不会改动任何已落地的资金流水（资金表对账全程不写）。
+  水位本身随运行记录持久化，进程重启后用同样的输入复跑结论逐项一致。
 - **连续两次运行的差异变化**：`GET /v1/reconcile/diff?older=A&newer=B`
   （或服务端 `diff_runs`）把两次留痕的差异项按稳定签名比对，输出
   `new_discrepancies`（这次新冒出来）、`persisting_discrepancies`（仍存在）、
   `resolved_discrepancies`（已消除）。
 - **并发对账**：留痕写入由仓储写锁串行化，并发发起的每次对账各自落一行独立运行
-  记录，结论互不串扰；对账全程不触碰资金流水表（有 8 线程并发对账 + 流水逐字段
-  比对测试）。
+  记录，结论互不串扰；对账全程不触碰资金流水表（有 8 线程并发全量对账 + 流水逐字段
+  比对、以及 8 线程并发增量对账不回退水位的测试）。
+
+### 8.1 本地复现空跑导致的水位回退（修复前行为）与验证
+
+```bash
+# 1) 跑全部用例（新增的空增量回归测试在 test_incremental_checkpoint.py）
+PYTHONPATH=. python3 -m unittest tests.test_incremental_checkpoint -v
+PYTHONPATH=. python3 -m unittest discover -t . -s tests -v
+```
+
+复现场景（也可直接用 HTTP 端点对 `payment_ledger.db` 操作）：
+
+1. 记一笔带 `external_ref` 的捕获，做一次留痕对账（水位推进到该流水的 `seq`）；
+2. 不新增任何流水，发起一次 `"incremental": true` 的空增量对账（模拟无资金动作营业日的
+   定时任务）；
+3. 再新增一笔流水，继续增量对账。
+
+修复前第 2 步会把 `max_seq` 落成 `0`，第 3 步从 `seq=0` 开始，把第 1 步已对上的老流水
+重新报成 `MISSING_IN_STATEMENT`，且结论与同范围全量对账对不上；修复后第 2 步水位保持
+不变，第 3 步只覆盖新增流水。可通过 `GET /v1/reconcile/runs` 查看每次运行解析后的
+`scope`（`from_seq`）与结论，确认空跑后 `from_seq` 不回退、老流水不再出现。
 
 ## 9. 兼容范围
 
